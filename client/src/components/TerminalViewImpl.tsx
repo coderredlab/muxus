@@ -30,6 +30,9 @@ import { SearchAddon, type ISearchOptions } from '@xterm/addon-search';
 import { SerializeAddon } from '@xterm/addon-serialize';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import { WebLinksAddon } from '@xterm/addon-web-links';
+// Type-only: the addon stays lazily imported at runtime so it lands in its
+// own async chunk instead of the eager xterm bundle.
+import type { WebglAddon } from '@xterm/addon-webgl';
 import '@xterm/xterm/css/xterm.css';
 import type { AppInfo, TerminalServerMessage } from '@muxus/shared';
 import {
@@ -39,7 +42,10 @@ import {
   wsUrl,
 } from '../api/http.js';
 import { useSavedHostProfiles, useSshConfig } from '../api/queries.js';
-import { copyToClipboard, readFromClipboard } from '../clipboard.js';
+import {
+  copyToClipboard,
+  readClipboardContent,
+} from '../clipboard.js';
 import { loadMonacoTextEditor, loadRemoteEditorWorkspace } from '../lazy-features.js';
 import { IS_MAC } from '../platform.js';
 import { exportFilename, saveTextFile } from '../save-file.js';
@@ -47,6 +53,7 @@ import { showToast } from '../state/toast.js';
 import { broadcastTerminalInput } from '../state/multi-exec.js';
 import {
   TERMINAL_SYMBOL_FONT,
+  sshKeepalivePrefField,
   terminalFontStack,
   terminalSchemeIdForMode,
   usePrefsStore,
@@ -84,6 +91,15 @@ import {
   terminalRightClickIntent,
   xtermRightClickSelectsWord,
 } from '../terminal/right-click.js';
+import {
+  isCurrentTerminalImagePasteTarget,
+  pasteTerminalClipboard,
+  storeLocalTerminalClipboardImage,
+  type TerminalClipboardPayload,
+  TerminalClipboardPasteQueue,
+  type TerminalImageLocation,
+  uploadTerminalClipboardImage,
+} from '../terminal/clipboard-paste.js';
 import {
   AuthPromptDialog,
   type AuthPromptRequest,
@@ -220,14 +236,25 @@ async function openLinkedTerminalFile(tabId: string, candidate: string): Promise
   useTabsStore.getState().openEditor(tabId, path);
 }
 
+interface PendingPaste {
+  text: string;
+  broadcast: boolean;
+  resolve: () => void;
+}
+
+/** One warning per page load: the failure is machine-wide, not per-terminal. */
+let webglUnavailableWarned = false;
+
 export default function TerminalViewImpl({ tab, active }: { tab: SessionTab; active: boolean }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const searchRef = useRef<SearchAddon | null>(null);
+  const terminalInputReadyRef = useRef(false);
   const serializeRef = useRef<SerializeAddon | null>(null);
   const imageRef = useRef<ImageAddon | null>(null);
+  const webglAddonRef = useRef<WebglAddon | null>(null);
   const keywordHighlighterRef = useRef<KeywordHighlighter | null>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   /** xterm's native default is enabled on macOS and disabled elsewhere. */
@@ -241,10 +268,14 @@ export default function TerminalViewImpl({ tab, active }: { tab: SessionTab; act
   const carryBufferRef = useRef<string | null>(null);
   /** Stored history is fetched at most once per mounted tab. */
   const snapshotFetchedRef = useRef(false);
+  const suppressNextInputBroadcastRef = useRef(false);
+  const clipboardPasteQueueRef = useRef<TerminalClipboardPasteQueue | null>(null);
+  const clipboardPasteQueue = (clipboardPasteQueueRef.current ??= new TerminalClipboardPasteQueue());
+  const pendingPasteResolverRef = useRef<(() => void) | null>(null);
   const theme = useTheme();
   const [authPrompt, setAuthPrompt] = useState<AuthPromptRequest | null>(null);
   const [hostKey, setHostKey] = useState<HostKeyRequest | null>(null);
-  const [pendingPaste, setPendingPaste] = useState<string | null>(null);
+  const [pendingPaste, setPendingPaste] = useState<PendingPaste | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchCase, setSearchCase] = useState(false);
@@ -256,6 +287,14 @@ export default function TerminalViewImpl({ tab, active }: { tab: SessionTab; act
     left: number;
     selection: string;
   } | null>(null);
+  useEffect(
+    () => () => {
+      clipboardPasteQueueRef.current?.cancelAll();
+      pendingPasteResolverRef.current?.();
+      pendingPasteResolverRef.current = null;
+    },
+    [],
+  );
   const [generation, setGeneration] = useState(tab.connectOnMount ? 1 : 0);
   const reconnectRequest = useTabsStore(
     (s) => s.tabs.find((candidate) => candidate.id === tab.id)?.reconnectRequest ?? 0,
@@ -272,6 +311,7 @@ export default function TerminalViewImpl({ tab, active }: { tab: SessionTab; act
   const cursorBlink = usePrefsStore((s) => s.cursorBlink);
   const cursorStyle = usePrefsStore((s) => s.cursorStyle);
   const scrollback = usePrefsStore((s) => s.scrollback);
+  const webglRenderer = usePrefsStore((s) => s.webglRenderer);
   const applicationSchemeId = usePrefsStore((prefs) =>
     terminalSchemeIdForMode(prefs, theme.palette.mode),
   );
@@ -342,13 +382,23 @@ export default function TerminalViewImpl({ tab, active }: { tab: SessionTab; act
     [searchCase, searchWord, searchRegex],
   );
 
-  const pasteText = (text: string) => {
+  const pasteToTerminal = (text: string, broadcast: boolean) => {
+    const term = termRef.current;
+    if (!term) return;
+    if (!broadcast) suppressNextInputBroadcastRef.current = true;
+    term.paste(text);
+  };
+
+  const pasteText = (text: string, broadcast = true): Promise<void> => {
     if (usePrefsStore.getState().pasteWarnMultiline && requiresPasteConfirmation(text)) {
       setSearchOpen(false);
-      setPendingPaste(text);
-      return;
+      const { promise, resolve } = Promise.withResolvers<void>();
+      pendingPasteResolverRef.current = resolve;
+      setPendingPaste({ text, broadcast, resolve });
+      return promise;
     }
-    termRef.current?.paste(text);
+    pasteToTerminal(text, broadcast);
+    return Promise.resolve();
   };
 
   /** Refit, unless the pane is hidden and there is nothing to measure. */
@@ -356,6 +406,15 @@ export default function TerminalViewImpl({ tab, active }: { tab: SessionTab; act
     if (!shouldFitTerminal(containerRef.current)) return false;
     fitRef.current?.fit();
     return true;
+  };
+
+  /** Return to the DOM renderer — the pref-off path and context loss share it. */
+  const dropWebglAddon = () => {
+    const webgl = webglAddonRef.current;
+    if (!webgl) return;
+    webglAddonRef.current = null;
+    webgl.dispose();
+    fitTerminal();
   };
 
   const applyZoom = (action: 'in' | 'out' | 'reset') => {
@@ -372,14 +431,68 @@ export default function TerminalViewImpl({ tab, active }: { tab: SessionTab; act
     }
   };
 
-  const pasteFromClipboard = () => {
-    void readFromClipboard().then((text) => {
-      if (text === null) {
-        showToast('warning', 'Clipboard read unavailable or denied — allow clipboard access, or paste with the keyboard.');
-        return;
-      }
-      if (text) pasteText(text);
+  const pasteFromClipboard = (
+    capture: (signal: AbortSignal) => Promise<TerminalClipboardPayload> = () =>
+      readClipboardContent(),
+  ) => {
+    const operation = clipboardPasteQueue.enqueue(capture, (clipboard, signal) => {
+      let stored: TerminalImageLocation | undefined;
+      return pasteTerminalClipboard(clipboard, {
+        uploadImage: async (png) => {
+          const current = useTabsStore
+            .getState()
+            .tabs.find((candidate) => candidate.id === tab.id);
+          if (current?.profile?.kind === 'local') {
+            stored = { kind: 'local' };
+            return storeLocalTerminalClipboardImage(png, signal);
+          }
+          if (current?.profile?.kind !== 'ssh') {
+            throw new Error('Image paste is available in SSH and local terminals.');
+          }
+          if (current.sftpAvailable === false) {
+            throw new Error('Image paste requires SFTP, which is disabled for this host.');
+          }
+          if (!current.connId) {
+            throw new Error('Reconnect the SSH session before pasting an image.');
+          }
+          stored = { kind: 'ssh', connectionId: current.connId };
+          return uploadTerminalClipboardImage(current.connId, png, signal);
+        },
+        pasteText,
+        pasteImagePath: async (path) => {
+          signal.throwIfAborted();
+          const current = useTabsStore
+            .getState()
+            .tabs.find((candidate) => candidate.id === tab.id);
+          if (
+            !isCurrentTerminalImagePasteTarget({
+              stored,
+              kind: current?.profile?.kind,
+              connectionId: current?.connId,
+              inputReady: terminalInputReadyRef.current,
+              socketOpen: wsRef.current?.readyState === WebSocket.OPEN,
+            })
+          ) {
+            throw new Error('The session disconnected before the image path was pasted.');
+          }
+          await pasteText(path, false);
+        },
+      });
     });
+    void operation
+      .then((result) => {
+        if (result.status === 'skipped' && result.reason === 'unavailable') {
+          showToast(
+            'warning',
+            'Clipboard read unavailable or denied — allow clipboard access, or paste with the keyboard.',
+          );
+        }
+      })
+      .catch((error: unknown) => {
+        if (error instanceof Error && error.name === 'AbortError') return;
+        const detail = error instanceof Error ? error.message : String(error);
+        showToast('error', `Could not paste clipboard content. ${detail}`);
+      });
   };
 
   // Right-click behavior is a preference: the terminal-emulator convention
@@ -426,6 +539,7 @@ export default function TerminalViewImpl({ tab, active }: { tab: SessionTab; act
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
+    terminalInputReadyRef.current = false;
     const shouldConnect = generation > 0;
     const reconnectCwd =
       tab.profile.kind === 'ssh' && tab.reconnectRequest > 0
@@ -536,6 +650,9 @@ export default function TerminalViewImpl({ tab, active }: { tab: SessionTab; act
     ])
       .then(() => {
         if (termRef.current !== term) return;
+        // The WebGL atlas caches glyphs rasterized with the fallback face;
+        // refresh alone would repaint those same bitmaps.
+        webglAddonRef.current?.clearTextureAtlas();
         term.refresh(0, term.rows - 1);
         fitTerminal();
       })
@@ -656,7 +773,9 @@ export default function TerminalViewImpl({ tab, active }: { tab: SessionTab; act
         const base = usePrefsStore.getState().monoFontSize;
         return Math.round(((base + zoomRef.current) / base) * 100);
       },
-      paste: (text) => pasteText(text),
+      paste: (text) =>
+        pasteFromClipboard(() => Promise.resolve({ kind: 'text', text })),
+      pasteClipboard: pasteFromClipboard,
       setLogging: (patch) => {
         const socket = wsRef.current;
         if (!socket || socket.readyState !== WebSocket.OPEN) return false;
@@ -666,12 +785,14 @@ export default function TerminalViewImpl({ tab, active }: { tab: SessionTab; act
     });
 
     const onNativePaste = (event: ClipboardEvent) => {
-      const text = event.clipboardData?.getData('text/plain');
-      if (!text || !usePrefsStore.getState().pasteWarnMultiline || !requiresPasteConfirmation(text)) return;
       event.preventDefault();
       event.stopImmediatePropagation();
-      setSearchOpen(false);
-      setPendingPaste(text);
+      const text = event.clipboardData?.getData('text/plain');
+      if (text) {
+        pasteFromClipboard(() => Promise.resolve({ kind: 'text', text }));
+      } else {
+        pasteFromClipboard();
+      }
     };
     el.addEventListener('paste', onNativePaste, true);
 
@@ -850,6 +971,12 @@ export default function TerminalViewImpl({ tab, active }: { tab: SessionTab; act
         // it was not when the terminal mounted. Measure now so the remote PTY
         // starts at the size on screen instead of being resized a beat later.
         if (!fitted) fitted = fitTerminal();
+        // Read the preference at send time, the way dialConnection does, so a
+        // change made while this socket was opening still applies.
+        const profile =
+          tab.profile.kind === 'ssh'
+            ? { ...tab.profile, ...sshKeepalivePrefField() }
+            : tab.profile;
         socket.send(JSON.stringify(
           attachTerminalId
             ? {
@@ -860,7 +987,8 @@ export default function TerminalViewImpl({ tab, active }: { tab: SessionTab; act
               }
             : {
                 op: 'connect',
-                profile: tab.profile,
+                profile,
+                freshTransport: tab.freshTransport,
                 title: tab.title,
                 cols: term.cols,
                 rows: term.rows,
@@ -967,6 +1095,7 @@ export default function TerminalViewImpl({ tab, active }: { tab: SessionTab; act
             break;
           case 'ready': {
             ready = true;
+            terminalInputReadyRef.current = true;
             if (!attachingExistingSession || readyAt === 0) readyAt = Date.now();
             if (!attachingExistingSession) rendererReattachAttempts = 0;
             if (rendererStableTimer !== undefined) clearTimeout(rendererStableTimer);
@@ -988,6 +1117,13 @@ export default function TerminalViewImpl({ tab, active }: { tab: SessionTab; act
               : shouldWaitForTerminalOutput(tab.profile.kind, receivedTerminalOutput);
             const sftpAvailable =
               tab.profile.kind === 'ssh' ? ctl.sftpAvailable !== false : undefined;
+            // Clear only the token this connect carried: a ready outracing the
+            // effect teardown must not erase a newer gesture's token.
+            const tokenUnchanged =
+              useTabsStore
+                .getState()
+                .tabs.find((candidate) => candidate.id === tab.id)
+                ?.freshTransport === tab.freshTransport;
             updateTab(tab.id, {
               status: transportSuspect
                 ? 'interrupted'
@@ -1001,6 +1137,9 @@ export default function TerminalViewImpl({ tab, active }: { tab: SessionTab; act
               sftpAvailable,
               ...(sftpAvailable === false ? { sftpOpen: false } : {}),
               transferId: undefined,
+              // The replacement connection is live; retries from here on may
+              // multiplex normally again.
+              ...(tokenUnchanged ? { freshTransport: undefined } : {}),
             });
             if (pendingTransferId) {
               completeTabTransfer(pendingTransferId);
@@ -1037,6 +1176,7 @@ export default function TerminalViewImpl({ tab, active }: { tab: SessionTab; act
         socketFailed = true;
       };
       socket.onclose = (event) => {
+        terminalInputReadyRef.current = false;
         if (wsRef.current === socket) wsRef.current = null;
         if (disposed) return;
         clearTransientStatus();
@@ -1199,8 +1339,13 @@ export default function TerminalViewImpl({ tab, active }: { tab: SessionTab; act
     const onData = term.onData((data) => {
       const normalized = normalizeTerminalKeyboardInput(data, inputKeyEvent, IS_MAC);
       inputKeyEvent = undefined;
-      if (sendInput(normalized)) broadcastTerminalInput(tab.id, normalized);
-      else reconnectFromTerminalInput();
+      const broadcast = !suppressNextInputBroadcastRef.current;
+      suppressNextInputBroadcastRef.current = false;
+      if (sendInput(normalized)) {
+        if (broadcast) broadcastTerminalInput(tab.id, normalized);
+      } else {
+        reconnectFromTerminalInput();
+      }
     });
     const onBinary = term.onBinary((data) => {
       const bytes = new Uint8Array(data.length);
@@ -1286,8 +1431,10 @@ export default function TerminalViewImpl({ tab, active }: { tab: SessionTab; act
       searchRef.current = null;
       serializeRef.current = null;
       imageRef.current = null;
+      webglAddonRef.current = null;
       keywordHighlighterRef.current = null;
       termRef.current = null;
+      terminalInputReadyRef.current = false;
       wsRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1320,11 +1467,59 @@ export default function TerminalViewImpl({ tab, active }: { tab: SessionTab; act
         ) {
           return;
         }
+        webglAddonRef.current?.clearTextureAtlas();
         term.refresh(0, term.rows - 1);
         fitTerminal();
       })
       .catch(() => undefined);
   }, [monoFontSize, fontFamily, lineHeight, cursorBlink, cursorStyle, scrollback, terminalTheme, generation]);
+
+  // The GPU renderer is a live preference: loading the addon hands painting
+  // over to WebGL, disposing it drops back to the DOM renderer — no session
+  // reopen either way. The import stays lazy so the chunk lands outside the
+  // eager bundle, and a context loss (backgrounded tab, GPU driver reset)
+  // disposes the addon, which also returns to the DOM renderer.
+  //
+  // The renderers disagree on cell width: DOM keeps the fractional measured
+  // width (14px JetBrains Mono = 8.4px) while WebGL floors it to whole device
+  // pixels (8.0). Swapping without a refit leaves the grid sized for the other
+  // renderer — dead space beside the pane and a visibly different pitch — so
+  // every swap refits.
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term) return;
+    if (!webglRenderer) {
+      dropWebglAddon();
+      return;
+    }
+    if (webglAddonRef.current) return;
+    let cancelled = false;
+    void import('@xterm/addon-webgl')
+      .then(({ WebglAddon }) => {
+        if (cancelled || termRef.current !== term || webglAddonRef.current) return;
+        const webgl = new WebglAddon();
+        webgl.onContextLoss(() => dropWebglAddon());
+        try {
+          term.loadAddon(webgl);
+        } catch (err) {
+          webgl.dispose();
+          throw err;
+        }
+        // Only a live addon may reach the ref: a failed activation must not
+        // suppress retries or make toggle-off dispose a renderer that never ran.
+        webglAddonRef.current = webgl;
+        fitTerminal();
+      })
+      .catch(() => {
+        // Chunk fetch failed or WebGL2 is unusable — the DOM renderer stays.
+        if (webglUnavailableWarned) return;
+        webglUnavailableWarned = true;
+        showToast('warning', 'GPU rendering is unavailable here — terminals keep the standard renderer.');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [webglRenderer, generation]);
 
   useEffect(() => {
     keywordHighlighterRef.current?.setRules(keywordHighlights);
@@ -1638,11 +1833,17 @@ export default function TerminalViewImpl({ tab, active }: { tab: SessionTab; act
       <HostKeyDialog request={hostKey} onAnswer={answerHostKey} />
       {pendingPaste !== null ? (
         <PasteConfirmDialog
-          initialText={pendingPaste}
-          onCancel={() => setPendingPaste(null)}
+          initialText={pendingPaste.text}
+          onCancel={() => {
+            setPendingPaste(null);
+            pendingPasteResolverRef.current = null;
+            pendingPaste.resolve();
+          }}
           onConfirm={(text) => {
             setPendingPaste(null);
-            termRef.current?.paste(text);
+            pendingPasteResolverRef.current = null;
+            pasteToTerminal(text, pendingPaste.broadcast);
+            pendingPaste.resolve();
             termRef.current?.focus();
           }}
         />

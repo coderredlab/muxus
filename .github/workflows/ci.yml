@@ -31,7 +31,7 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: 24.18.0
+          node-version: 24.20.0
           cache: pnpm
 
       - name: Install dependencies
@@ -46,29 +46,8 @@ jobs:
       - name: Test
         run: pnpm test
 
-      - name: Check bundle budgets
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          pnpm --filter @muxus/client build
-
-          if [ -z "$BASE_SHA" ]; then
-            node client/scripts/check-bundle-budget.mjs
-            exit
-          fi
-
-          base_dir="$RUNNER_TEMP/muxus-base"
-          base_report="$RUNNER_TEMP/base-bundle.json"
-          git fetch --no-tags --depth=1 origin "$BASE_SHA"
-          git worktree add --detach "$base_dir" "$BASE_SHA"
-          pnpm --dir "$base_dir" install --frozen-lockfile
-          pnpm --dir "$base_dir" --filter @muxus/shared build
-          pnpm --dir "$base_dir" --filter @muxus/client build
-          node client/scripts/check-bundle-budget.mjs \
-            --dist "$base_dir/client/dist" \
-            --write-report "$base_report" \
-            --report-only
-          node client/scripts/check-bundle-budget.mjs --baseline "$base_report"
+      - name: Test release submission safeguards
+        run: pnpm test:release
 
   package-smoke:
     name: Package (${{ matrix.name }})
@@ -103,7 +82,7 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: 24.18.0
+          node-version: 24.20.0
           cache: pnpm
 
       - name: Install dependencies
@@ -129,8 +108,29 @@ jobs:
       - name: Build workspace
         run: pnpm build
 
+      # dist does this itself; pack:dir needs the bundled X server prepared.
+      - name: Prepare bundled X server
+        if: runner.os == 'Windows'
+        run: node electron/scripts/vcxsrv.mjs
+
       - name: Build unpacked desktop application
         run: pnpm --filter @muxus/electron pack:dir ${{ matrix.pack_args }}
+
+      - name: Smoke-test bundled X server
+        if: runner.os == 'Windows'
+        run: node hack/smoke-x11-server.mjs
+
+      # CI exercises AppX without credentials or a reserved product. These
+      # placeholder packages are never uploaded or submitted to the Store.
+      - name: Smoke-test Microsoft Store packaging
+        if: matrix.name == 'Windows x64'
+        run: pnpm --filter @muxus/electron dist:store
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          MICROSOFT_STORE_PRODUCT_ID: 9MUXUS000000
+          MICROSOFT_STORE_IDENTITY_NAME: Muxus.CI
+          MICROSOFT_STORE_PUBLISHER: CN=Muxus CI
+          MICROSOFT_STORE_PUBLISHER_DISPLAY_NAME: Muxus CI
 
       - name: Verify Windows ARM64 native binaries
         if: matrix.name == 'Windows ARM64'

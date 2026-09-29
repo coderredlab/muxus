@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   app,
+  clipboard,
   BrowserWindow,
   dialog,
   type IpcMainEvent,
@@ -22,9 +23,15 @@ import {
 import { isNewerVersion } from '@muxus/shared';
 import type {
   AppWindowLaunch,
+  CommandLineLaunch,
   MobaXtermSessionSource,
   UpdateCheckResult,
 } from '@muxus/shared';
+import {
+  canHandleCommandLineLaunch,
+  parseCommandLineLaunch,
+  parseCommandLineLaunchData,
+} from './command-line.js';
 import {
   developmentUserDataPath,
   seedDevelopmentDatabase,
@@ -34,11 +41,13 @@ import { initMainLog, installCrashCapture, mainLog, mainLogPath } from './main-l
 import { readLocalMobaXtermSessions } from './mobaxterm.js';
 import { workspaceOwnershipUpdate } from './workspace-window-state.js';
 import { pointInsideAnyWindow } from './tab-detach.js';
+import { checkStoreUpdate, type DistributionMetadata } from './store-updates.js';
 
 // Name first: userData (and with it the log location) derives from it.
 app.setName('Muxus');
 const installedUserDataPath = app.getPath('userData');
 const isDevelopment = !app.isPackaged;
+const distributionMetadata = JSON.parse(readFileSync(path.join(app.getAppPath(), 'package.json'), 'utf8')) as DistributionMetadata;
 if (isDevelopment) {
   const userDataPath = developmentUserDataPath(installedUserDataPath);
   mkdirSync(userDataPath, { recursive: true, mode: 0o700 });
@@ -70,11 +79,15 @@ const EXTERNAL_PROTOCOLS = new Set(['http:', 'https:', 'mailto:']);
 const TITLEBAR_HEIGHT = 52;
 const UPDATE_MANIFEST_URL = 'https://flosch62.github.io/muxus/latest.json';
 const UPDATE_CHECK_TIMEOUT_MS = 10_000;
+const CLIPBOARD_IMAGE_MAX_BYTES = 18 * 1024 * 1024;
+const CLIPBOARD_IMAGE_MAX_PIXELS = 32 * 1024 * 1024;
 
 let primaryWindow: BrowserWindow | undefined;
 let appUrl: string | undefined;
 const managedWindows = new Set<BrowserWindow>();
 const windowLaunches = new Map<number, AppWindowLaunch>();
+const commandLineLaunches = new Map<number, CommandLineLaunch>();
+const deferredCommandLineLaunches: CommandLineLaunch[] = [];
 const activeWorkspaceByWebContents = new Map<number, string>();
 let server: RunningServer | undefined;
 let closing: Promise<void> | undefined;
@@ -92,6 +105,11 @@ interface AppInfo {
   name: string;
   version: string;
 }
+
+type DesktopClipboardContent =
+  | { kind: 'text'; text: string }
+  | { kind: 'image'; png: Uint8Array<ArrayBuffer> }
+  | { kind: 'empty' };
 
 interface UpdateManifest {
   version?: unknown;
@@ -231,6 +249,8 @@ function releaseUrl(value: unknown): string | undefined {
 
 async function checkForUpdate(force = false): Promise<UpdateCheckResult> {
   const currentVersion = app.getVersion();
+  const storeResult = await checkStoreUpdate(distributionMetadata, process.windowsStore === true, currentVersion, force, (url) => shell.openExternal(url));
+  if (storeResult) return storeResult;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), UPDATE_CHECK_TIMEOUT_MS);
   try {
@@ -275,7 +295,11 @@ async function checkForUpdate(force = false): Promise<UpdateCheckResult> {
   }
 }
 
-function createWindow(url: string, launch?: AppWindowLaunch): BrowserWindow {
+function createWindow(
+  url: string,
+  launch?: AppWindowLaunch,
+  commandLineLaunch?: CommandLineLaunch,
+): BrowserWindow {
   const state = loadWindowState();
   const appOrigin = new URL(url).origin;
   const isPrimary = !primaryWindow;
@@ -312,6 +336,7 @@ function createWindow(url: string, launch?: AppWindowLaunch): BrowserWindow {
   managedWindows.add(win);
   const webContentsId = win.webContents.id;
   if (launch) windowLaunches.set(webContentsId, launch);
+  if (commandLineLaunch) commandLineLaunches.set(webContentsId, commandLineLaunch);
   if (isPrimary) primaryWindow = win;
   if (state.maximized && isPrimary) win.maximize();
   // The menu stays installed so its accelerators (zoom, reload, devtools,
@@ -323,6 +348,7 @@ function createWindow(url: string, launch?: AppWindowLaunch): BrowserWindow {
   win.on('closed', () => {
     managedWindows.delete(win);
     windowLaunches.delete(webContentsId);
+    commandLineLaunches.delete(webContentsId);
     activeWorkspaceByWebContents.delete(webContentsId);
     if (primaryWindow === win) primaryWindow = undefined;
   });
@@ -458,6 +484,15 @@ ipcMain.on('muxus:window-launch', (event) => {
     : undefined;
 });
 
+ipcMain.on('muxus:command-line-launch', (event) => {
+  if (!isManagedWindowSender(event)) {
+    event.returnValue = undefined;
+    return;
+  }
+  event.returnValue = commandLineLaunches.get(event.sender.id);
+  commandLineLaunches.delete(event.sender.id);
+});
+
 ipcMain.on('muxus:open-window', (event, value: unknown) => {
   if (!isManagedWindowSender(event) || !appUrl) return;
   const launch = parseWindowLaunch(value);
@@ -589,6 +624,51 @@ ipcMain.handle('muxus:check-for-update', async (event, options?: { force?: unkno
   return updateCheck;
 });
 
+/** Width and height from a PNG's IHDR chunk, read without decoding the pixels. */
+function pngDimensions(png: Uint8Array): { width: number; height: number } | undefined {
+  // 8-byte signature, then the IHDR chunk: length, type, width, height.
+  if (png.byteLength < 24) return undefined;
+  const view = new DataView(png.buffer, png.byteOffset, png.byteLength);
+  if (view.getUint32(0) !== 0x89504e47 || view.getUint32(4) !== 0x0d0a1a0a) return undefined;
+  if (view.getUint32(12) !== 0x49484452) return undefined;
+  return { width: view.getUint32(16), height: view.getUint32(20) };
+}
+
+ipcMain.handle(
+  'muxus:read-clipboard-content',
+  async (event): Promise<DesktopClipboardContent | undefined> => {
+    if (!isManagedWindowSender(event)) return undefined;
+    const text = await clipboard.readText();
+    if (text) return { kind: 'text', text };
+
+    const item = (await clipboard.read()).find((candidate) => candidate.types.includes('image/png'));
+    if (!item) return { kind: 'empty' };
+    // Every type but the bookmark one resolves to a Blob.
+    const blob = (await item.getType('image/png')) as Blob;
+    if (blob.size > CLIPBOARD_IMAGE_MAX_BYTES) {
+      throw new Error('The clipboard image is too large to paste.');
+    }
+
+    // Check the header before anything decodes it: a small PNG can still
+    // declare dimensions that would need gigabytes once expanded.
+    const png = new Uint8Array(await blob.arrayBuffer());
+    const size = pngDimensions(png);
+    if (!size) throw new Error('The clipboard image could not be read.');
+    const { width, height } = size;
+    const pixels = width * height;
+    if (
+      width <= 0 ||
+      height <= 0 ||
+      !Number.isFinite(pixels) ||
+      pixels > CLIPBOARD_IMAGE_MAX_PIXELS ||
+      png.byteLength > CLIPBOARD_IMAGE_MAX_BYTES
+    ) {
+      throw new Error('The clipboard image is too large to paste.');
+    }
+    return { kind: 'image', png };
+  },
+);
+
 ipcMain.handle('muxus:select-private-key', async (event): Promise<string | undefined> => {
   const win = senderWindow(event);
   if (!win) return undefined;
@@ -654,6 +734,16 @@ function parseWindowLaunch(value: unknown): AppWindowLaunch | undefined {
             Number.isInteger(profile.port) &&
             profile.port >= 1 &&
             profile.port <= 65_535))) ||
+      ((profile.kind === 'rdp' || profile.kind === 'vnc') &&
+        validProfileId(profile.profileId) &&
+        typeof profile.host === 'string' &&
+        profile.host.length > 0 &&
+        profile.host.length <= 253 &&
+        (profile.port === undefined ||
+          (typeof profile.port === 'number' &&
+            Number.isInteger(profile.port) &&
+            profile.port >= 1 &&
+            profile.port <= 65_535))) ||
       (profile.kind === 'serial' &&
         validProfileId(profile.profileId) &&
         typeof profile.path === 'string' &&
@@ -706,14 +796,44 @@ function validProfileId(value: unknown): boolean {
   );
 }
 
-if (!app.requestSingleInstanceLock()) {
+const initialCommandLineLaunch = parseCommandLineLaunch(process.argv);
+
+function commandLineLaunchWindow(): BrowserWindow | undefined {
+  return [...managedWindows].find((candidate) =>
+    canHandleCommandLineLaunch(windowLaunches.get(candidate.webContents.id)),
+  );
+}
+
+// Electron may reorder split-form custom switches in second-instance argv.
+// Preserve the launch parsed by the invoking process as structured data.
+if (!app.requestSingleInstanceLock(initialCommandLineLaunch ?? {})) {
   app.quit();
 } else {
-  app.on('second-instance', () => {
-    const win = primaryWindow ?? [...managedWindows][0];
-    if (win) {
-      if (win.isMinimized()) win.restore();
-      win.focus();
+  app.on('second-instance', (_event, commandLine, _workingDirectory, additionalData) => {
+    const launch =
+      parseCommandLineLaunchData(additionalData) ??
+      parseCommandLineLaunch(commandLine);
+    const win = launch
+      ? (commandLineLaunchWindow() ?? (appUrl ? createWindow(appUrl) : undefined))
+      : (primaryWindow ?? [...managedWindows][0]);
+    if (!win) {
+      if (launch) deferredCommandLineLaunches.push(launch);
+      return;
+    }
+    if (win.isMinimized()) win.restore();
+    win.show();
+    win.focus();
+    if (launch) {
+      const send = () => {
+        if (!win.isDestroyed()) {
+          win.webContents.send('muxus:command-line-launch-requested', launch);
+        }
+      };
+      if (win.webContents.isLoadingMainFrame()) {
+        win.webContents.once('did-finish-load', send);
+      } else {
+        send();
+      }
     }
   });
 
@@ -749,6 +869,13 @@ if (!app.requestSingleInstanceLock()) {
         staticRoot: app.isPackaged
           ? path.join(process.resourcesPath, 'client')
           : path.resolve(moduleDir, '../../client/dist'),
+        // Windows builds ship VcXsrv for X11 forwarding (see scripts/vcxsrv.mjs).
+        x11ServerDirectory:
+          process.platform !== 'win32'
+            ? undefined
+            : app.isPackaged
+              ? path.join(process.resourcesPath, 'vcxsrv')
+              : path.resolve(moduleDir, '../vendor/vcxsrv'),
       });
     } catch (err) {
       mainLog('error', 'the embedded server failed to start', err);
@@ -766,7 +893,16 @@ if (!app.requestSingleInstanceLock()) {
     buildMenu();
     const url = server.url;
     appUrl = url;
-    createWindow(url);
+    const win = createWindow(url, undefined, initialCommandLineLaunch);
+    if (deferredCommandLineLaunches.length > 0) {
+      const launches = deferredCommandLineLaunches.splice(0);
+      win.webContents.once('did-finish-load', () => {
+        if (win.isDestroyed()) return;
+        for (const launch of launches) {
+          win.webContents.send('muxus:command-line-launch-requested', launch);
+        }
+      });
+    }
   });
 
   // The server (and its SSH connections) is tied to the window, so quit

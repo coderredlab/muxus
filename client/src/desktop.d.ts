@@ -1,9 +1,15 @@
 import type {
   AppInfo,
   AppWindowLaunch,
+  CommandLineLaunch,
   MobaXtermSessionSource,
   UpdateCheckResult,
 } from '@muxus/shared';
+
+type DesktopClipboardContent =
+  | { kind: 'text'; text: string }
+  | { kind: 'image'; png: Uint8Array<ArrayBuffer> }
+  | { kind: 'empty' };
 
 declare global {
   /** Bridge exposed by the Electron preload (absent in regular browsers). */
@@ -15,6 +21,8 @@ declare global {
       authToken: string;
       /** One-shot payload describing the content of a secondary app window. */
       windowLaunch?: AppWindowLaunch;
+      /** One-shot host, folder, or workspace target supplied to the executable. */
+      commandLineLaunch?: CommandLineLaunch;
       stateStorage: {
         getItem(name: string): string | null;
         setItem(name: string, value: string): void;
@@ -25,6 +33,8 @@ declare global {
       setZoomFactor(factor: number): void;
       getAppInfo(): Promise<AppInfo | undefined>;
       checkForUpdate(options?: { force?: boolean }): Promise<UpdateCheckResult>;
+      /** Capture OS clipboard text or a validated PNG in one main-process snapshot. */
+      readClipboardContent(): Promise<DesktopClipboardContent | undefined>;
       /** Choose an SSH private key with the operating system's file picker. */
       selectPrivateKey(): Promise<string | undefined>;
       /** Read bookmark-only sessions from the current Windows user's MobaXterm install. */
@@ -33,6 +43,8 @@ declare global {
       listLocalFontFamilies(): Promise<string[] | undefined>;
       /** Open a secondary native application window. */
       openWindow(launch: AppWindowLaunch): void;
+      /** Subscribe to launch targets forwarded by later executable invocations. */
+      onCommandLineLaunch(callback: (launch: CommandLineLaunch) => void): () => void;
       /** Open a tab-transfer window when the native cursor is outside every app window. */
       detachTab(
         launch: Extract<AppWindowLaunch, { kind: 'tab-transfer' }>,

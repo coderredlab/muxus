@@ -28,6 +28,7 @@ function handle(sendInput: TerminalHandle['sendInput']): TerminalHandle {
     zoomReset: vi.fn(),
     zoomPercent: () => 100,
     paste: vi.fn(),
+    pasteClipboard: vi.fn(),
     setLogging: vi.fn(() => true),
     persistSnapshot: vi.fn(async () => undefined),
     prepareTransfer: vi.fn(async () => true),
@@ -158,6 +159,21 @@ describe('multi-execution routing', () => {
     expect(toggleMultiExec()).toBe(true);
     expect(useMultiExecStore.getState().selectedIds).toEqual([]);
     expect(useToastStore.getState().toast).toMatchObject({ severity: 'info' });
+  });
+
+  it('leaves remote desktops out of mirrored input', () => {
+    connectTab('edge-1');
+    useTabsStore.getState().split(useTabsStore.getState().activePaneId, 'right');
+    const desktop = useTabsStore
+      .getState()
+      .open({ kind: 'vnc', host: 'design-vm', port: 5900, username: '', resizeRemote: false, viewOnly: false, shareClipboard: true }, 'design-vm');
+    useTabsStore.getState().update(desktop, { status: 'connected' });
+
+    expect(toggleMultiExec()).toBe(true);
+    expect(useMultiExecStore.getState().selectedIds).toEqual([]);
+    expect(useToastStore.getState().toast).toMatchObject({
+      message: expect.stringContaining('two sessions'),
+    });
   });
 
   it('says why the shortcut did nothing when there is nothing to mirror', () => {

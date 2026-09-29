@@ -1,4 +1,4 @@
-import { copyToClipboard, readFromClipboard } from '../clipboard.js';
+import { copyToClipboard } from '../clipboard.js';
 import { IS_MAC } from '../platform.js';
 import { requestCloseRemoteEditor } from '../editor/remote-editor-registry.js';
 import {
@@ -6,11 +6,12 @@ import {
   openEmptyTab,
   requestCloseActivePane,
   requestCloseTabs,
+  requestForceReconnectAll,
   splitActivePane,
   toggleMultiExec,
 } from '../session-actions.js';
 import { usePrefsStore } from '../state/prefs.js';
-import { PANE_RESIZE_STEP, useTabsStore } from '../state/tabs.js';
+import { PANE_RESIZE_STEP, isRemoteSessionTab, useTabsStore } from '../state/tabs.js';
 import { useUiStore } from '../state/ui.js';
 import { terminalHandle } from '../terminal/terminal-registry.js';
 import type { PaneDirection } from '../state/workspace-layout.js';
@@ -288,9 +289,7 @@ export const KEY_COMMANDS: readonly KeyCommand[] = [
     run: () => {
       const handle = activeTerminal();
       if (!handle) return false;
-      void readFromClipboard().then((text) => {
-        if (text) handle.paste(text);
-      });
+      handle.pasteClipboard();
       return true;
     },
   },
@@ -353,6 +352,18 @@ export const KEY_COMMANDS: readonly KeyCommand[] = [
     defaultChords: ['Mod+Shift+M'],
     keywords: ['multi-exec', 'mirror', 'broadcast', 'sync input', 'all sessions'],
     run: () => toggleMultiExec(),
+  },
+  {
+    id: 'terminal.force-reconnect-all',
+    title: 'Force reconnect all remote sessions',
+    category: 'terminal',
+    defaultChords: [],
+    keywords: ['ssh', 'telnet', 'serial', 'restart', 'replace', 'stuck', 'hung'],
+    run: () => {
+      if (!tabs().tabs.some(isRemoteSessionTab)) return false;
+      void requestForceReconnectAll();
+      return true;
+    },
   },
   {
     id: 'terminal.zoom-in',
